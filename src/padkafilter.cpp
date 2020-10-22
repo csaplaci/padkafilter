@@ -11,9 +11,11 @@
 #include <pcl/point_types.h>
 #include <pcl/filters/crop_box.h>
 #include <visualization_msgs/Marker.h>
+#include <dynamic_reconfigure/server.h>
+#include <padkafilter/PadkaConfig.h>
 
 int rep=128; // number of detection boxes
-float slope_param=1.732; //60 deg
+double slope_param=1.732; //60 deg
 
 std::vector<float> bsin(rep),bcos(rep),nsin(rep),ncos(rep);
 
@@ -61,6 +63,12 @@ std::vector<float> smoothen (std::vector<float> in_points, std::vector<float> ke
   return pts;
 };
 
+void dyncfg_callback(padkafilter::PadkaConfig &config, uint32_t level)
+{
+  slope_param = tan(config.slope_angle/180*M_PI);
+  ROS_INFO("Slope angle: %f [DEG]", config.slope_angle);
+};
+
 void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
 {
     pcl::PCLPointCloud2 cloud_filtered;
@@ -97,8 +105,6 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
     // Set the marker action.  Options are ADD and DELETE
     marker.action = visualization_msgs::Marker::ADD;
 
-    /*
-
     // Set the pose of the marker.  This is a full 6DOF pose relative to the frame/time specified in the header
     marker.pose.position.x = 0;
     marker.pose.position.y = 0;
@@ -107,8 +113,6 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
     marker.pose.orientation.y = 0.0;
     marker.pose.orientation.z = 0.0;
     marker.pose.orientation.w = 1.0;
-
-    */
 
     // Set the scale of the marker -- 1x1x1 here means 1m on a side
     marker.scale.x = .2;
@@ -259,15 +263,18 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
           data.position.z = testy[i];
         */
 
-          to_py_arr.poses.push_back(data);
+          if (mc==56) {to_py_arr.poses.push_back(data);}
         }
       
-      pcl::transformPointCloud(cloud_out_xyz, cloud_filt_xyz, zrotback);
+        pcl::transformPointCloud(cloud_out_xyz, cloud_filt_xyz, zrotback);
 
-      tempoint.x = cloud_filt_xyz.points[maxind].x;
-      tempoint.y = cloud_filt_xyz.points[maxind].y;
-      tempoint.z = cloud_filt_xyz.points[maxind].z;
-      marker.points.push_back(tempoint);
+        if (found)
+        {
+          tempoint.x = cloud_filt_xyz.points[maxind].x;
+          tempoint.y = cloud_filt_xyz.points[maxind].y;
+          tempoint.z = cloud_filt_xyz.points[maxind].z;
+          marker.points.push_back(tempoint);
+        }
       }
     }
 
@@ -276,7 +283,7 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
     std_msgs::String msg;
     std::stringstream ss;
 
-    ss << "[debug]";
+    ss << "[debug] slope_param = " << slope_param;
 
     msg.data = ss.str();
     ROS_INFO("%s", msg.data.c_str());
@@ -297,6 +304,7 @@ int main(int argc, char **argv)
     ros::init(argc,argv,"PadkaFilter");
     ros::NodeHandle nh;
     ROS_INFO("Padkafilter node started.");
+    ROS_INFO("init_param: %f", slope_param);
 
     for (int i=0; i<rep; i++)
     {
@@ -310,6 +318,12 @@ int main(int argc, char **argv)
     boxfilcloud_pub = nh.advertise<pcl::PCLPointCloud2>("boxfilter", 1);
     marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 1);
     to_py_pub = nh.advertise<geometry_msgs::PoseArray>("/tmp_py", 1);
+
+    dynamic_reconfigure::Server<padkafilter::PadkaConfig> dyncfg_server;
+    dynamic_reconfigure::Server<padkafilter::PadkaConfig>::CallbackType cbt;
+
+    cbt = boost::bind(dyncfg_callback, _1, _2);
+    dyncfg_server.setCallback(cbt);
 
     ros::spin();
 }
