@@ -16,6 +16,8 @@
 
 int rep=128; // number of detection boxes
 double slope_param=1.732; //60 deg
+std::string frame_param = "right_os1/os1_sensor"; //lidar frame
+std::string topic_param = "/right_os1/os1_cloud_node/points"; //input topic
 
 std::vector<float> bsin(rep),bcos(rep),nsin(rep),ncos(rep);
 
@@ -66,7 +68,12 @@ std::vector<float> smoothen (std::vector<float> in_points, std::vector<float> ke
 void dyncfg_callback(padkafilter::PadkaConfig &config, uint32_t level)
 {
   slope_param = tan(config.slope_angle/180*M_PI);
+  frame_param = config.frame;
+  topic_param = config.topic;
   ROS_INFO("Slope angle: %f [DEG]", config.slope_angle);
+  ROS_INFO("Frame: \"%s\"", frame_param.c_str());
+  ROS_INFO("Topic: \"%s\" (node needs to be restarted after reconfiguration)", topic_param.c_str());
+
 };
 
 void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
@@ -90,9 +97,9 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud)
     visualization_msgs::Marker marker;
     geometry_msgs::PoseArray to_py_arr;
     to_py_arr.header.stamp = ros::Time::now();
-    to_py_arr.header.frame_id = "right_os1/os1_sensor";
+    to_py_arr.header.frame_id = frame_param;
     
-    marker.header.frame_id = "right_os1/os1_sensor";
+    marker.header.frame_id = frame_param;
     marker.header.stamp = ros::Time::now();
     // Set the namespace and id for this marker.  This serves to create a unique ID
     // Any marker sent with the same namespace and id will overwrite the old one
@@ -314,16 +321,17 @@ int main(int argc, char **argv)
       ncos[i] = cos(-M_PI*2/rep*i);
     }
 
-    ros::Subscriber sub = nh.subscribe("/right_os1/os1_cloud_node/points", 1, callback);
-    boxfilcloud_pub = nh.advertise<pcl::PCLPointCloud2>("boxfilter", 1);
-    marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 1);
-    to_py_pub = nh.advertise<geometry_msgs::PoseArray>("/tmp_py", 1);
-
     dynamic_reconfigure::Server<padkafilter::PadkaConfig> dyncfg_server;
     dynamic_reconfigure::Server<padkafilter::PadkaConfig>::CallbackType cbt;
 
     cbt = boost::bind(dyncfg_callback, _1, _2);
     dyncfg_server.setCallback(cbt);
+
+    ros::Subscriber sub = nh.subscribe(topic_param, 1, callback);
+    boxfilcloud_pub = nh.advertise<pcl::PCLPointCloud2>("boxfilter", 1);
+    marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 1);
+    to_py_pub = nh.advertise<geometry_msgs::PoseArray>("/tmp_py", 1);
+
 
     ros::spin();
 }
