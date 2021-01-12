@@ -30,13 +30,12 @@ struct polar {
   int id;
   float r;
   float fi;
-  float z;
 };
 struct box {
   std::vector<polar> p;
   box *l,*r; //szomszédos filterek - l=left=next, r=right=previous (névütközés miatt)
-  bool yx; //y>x (tg > 45 deg)
-  float fi, o, d; //szög + oldalirányú (tg offset), hosszirányú (radiális) és transzformációs szorzó paraméterek
+  bool yx; //y>x (tan -> fi > 45 deg?)
+  float fi, o, d; //szög + oldalirányú (tg offset) és hosszirányú (radiális) szorzó paraméterek
 };
 
 std::vector<box> beams(rep);
@@ -50,7 +49,7 @@ std::vector<geometry_msgs::Point> mpoint(rep);
 ros::Publisher boxfilcloud_pub;
 ros::Publisher marker_pub;
 
-bool ptcmpr(polar a, polar b) { return (a.r<b.r); } // comparing points by beam-direction coordinates
+bool ptcmpr(polar a, polar b) { return (a.r<b.r); } // r-koordináta alapú összehasonlítás
 struct chain
 {
   float x,y,slope;
@@ -64,11 +63,14 @@ float slope(float x0, float y0, float x1, float y1)
 void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
 {
   int i=0, s=beams[tid].p.size();
+  float c;
   if (beams[tid].yx)
   {
     while (i<s)
     {
-      if ((beams[tid].d * cloud->points[beams[tid].p[i].id].y - beams[tid].o) < cloud->points[beams[tid].p[i].id].x < (beams[tid].d * cloud->points[beams[tid].p[i].id].y + beams[tid].o))
+      c=abs(beams[tid].d * cloud->points[beams[tid].p[i].id].y); //nyaláb középvonalának x-koordinátája a pontnál (ahol a pont y-koordinátája metszi azt)
+
+      if ((c - beams[tid].o) < cloud->points[beams[tid].p[i].id].x < (c + beams[tid].o)) //középvonal +-nyaláb (fél)szélessége x-irányban - beleesik-e a pont
       {
         //beams[tid].p[i].r*=cos(beams[tid].fi-beams[tid].p[i].fi); // transform - nem tudom miért, de zajosabb ettől (fordítva kéne lennie)
         i++;
@@ -84,7 +86,9 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
   {
     while (i<s)
     {
-      if ((beams[tid].d * cloud->points[beams[tid].p[i].id].x - beams[tid].o) < cloud->points[beams[tid].p[i].id].y < (beams[tid].d * cloud->points[beams[tid].p[i].id].x + beams[tid].o))
+      c=abs(beams[tid].d * cloud->points[beams[tid].p[i].id].x); //nyaláb középvonalának y-koordinátája a pontnál (ahol a pont x-koordinátája metszi azt)
+
+      if ((c - beams[tid].o) < cloud->points[beams[tid].p[i].id].y < (c + beams[tid].o)) //középvonal +-nyaláb (fél)szélessége y-irányban - beleesik-e a pont
       {
         //beams[tid].p[i].r*=cos(beams[tid].fi-beams[tid].p[i].fi);
         i++;
@@ -96,7 +100,7 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
       }
     }
   }
-  
+
   std::sort(beams[tid].p.begin(),beams[tid].p.end(),ptcmpr);
 
   {
@@ -106,9 +110,8 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
     for (int i=0;i<s;i++)
     {
       data[tid].position.x = beams[tid].p[i].r;
-      //data[tid].position.z = cloud.points[beams[tid].p[i].id].z;
-      data[tid].position.z = beams[tid].p[i].z;
-      data[tid].position.y = (i) ? (slope(beams[tid].p[i-1].r,beams[tid].p[i-1].z,beams[tid].p[i].r,beams[tid].p[i].z)):(0.0);
+      data[tid].position.z = cloud->points[beams[tid].p[i].id].z;
+      data[tid].position.y = (i) ? (slope(beams[tid].p[i-1].r,cloud->points[beams[tid].p[i-1].id].z,beams[tid].p[i].r,cloud->points[beams[tid].p[i].id].z)):(0.0); // z/r slope(i-1,i)
       //if (not false positive)
       if (!found)
       {
@@ -157,7 +160,7 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
       fi=atan2(cloud.points[i].y,cloud.points[i].x);
       if (fi<0) fi+=2*M_PI;
       f=(int)(fi*Kfi);
-      beamp[f]->p.push_back(polar{i,r,fi,cloud.points[i].z});
+      beamp[f]->p.push_back(polar{i,r,fi});
         /*
         if (r<5)
         {
@@ -205,27 +208,23 @@ int main(int argc, char **argv)
   ROS_INFO("init_param: %f", slope_param);
 
 
-  {
-    float fi, tf, off = 0.5*width; // fi + tangenciális offset (vastagság fele)
+  { //nyaláb inicializálás
+    float fi, off = 0.5*width; // fi + tangenciális offset (szélesség fele)
     for (int i=0; i<rep; i++)
     {
       fi=i*2*M_PI/rep; // nyaláb (x-tengellyel bezárt) szöge
       if (abs(tan(fi))>1) // y>x ? (kb. melyik irányba áll inkább)
       {
         beams[i].yx=true; //y-irányú
-        beams[i].d = abs(tan(0.5*M_PI-fi)); // =1/tan(fi)
-        if (fi>0.5*M_PI) beams[i].d*=-1; //nem tudom, miért működik ezzel ilyen jól, ide valami hasonló kéne, de nem pont ez (valszeg csak más fi értékekre - todo)
-        tf = sin(fi);
-        beams[i].o = off/tf; // =off/sin(fi)
-        beams[i].fi=fi;
+        beams[i].d = tan(0.5*M_PI-fi); // =1/tan(fi)
+        beams[i].o = off/sin(fi);
+        beams[i].fi=fi; // kell?
       }
       else
       {
         beams[i].yx=false; //x-irányú
-        beams[i].d = abs(tan(fi));
-        if (fi>0.5*M_PI) beams[i].d*=-1;
-        tf = cos(fi);
-        beams[i].o = off/tf; // =off/cos(fi)
+        beams[i].d = tan(fi);
+        beams[i].o = off/cos(fi);
         beams[i].fi=fi;
       }
       beamp[i]=&beams[i]; //pointerek (lásd lentebb [n+1 -> 0])
@@ -283,11 +282,10 @@ int main(int argc, char **argv)
   marker.scale.z = .2;
 
   // Set the color -- be sure to set alpha to something non-zero!
-  marker.color.r = 1.0f;
-  marker.color.g = 0.0f;
-  marker.color.b = 0.0f;
-  marker.color.a = 1.0f;
-//X-mas deco added: fancy red markers [[no x-mas tree, it needs root access :) ]]
+  marker.color.r = 0.2f;
+  marker.color.g = 0.8f;
+  marker.color.b = 0.2f;
+  marker.color.a = 0.8f;
 
 
   ROS_INFO("STATUS: READY");
