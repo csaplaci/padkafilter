@@ -6,12 +6,14 @@
 #include <std_msgs/String.h>
 #include <sstream>
 #include <geometry_msgs/PoseArray.h>
+#include <geometry_msgs/PolygonStamped.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl_ros/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/crop_box.h>
 #include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
 #include <dynamic_reconfigure/server.h>
 #include <padkafilter/PadkaConfig.h>
 
@@ -21,10 +23,16 @@ float length=26.0;
 float offset = 2.0; //radiális offset
 float rmin = 2.0;
 float rmax = 26.0;
+float polydist = 4.0; // 2m (négyzete - a számításigény csökkentéséért) //todo ezeket paraméterként
+float polyangle = 1.0; // (rad)
 float Kfi, minfi, maxfi;
 double slope_param=1.732; //60 deg
 std::string frame_param = "right_os1/os1_sensor"; //lidar frame
 std::string topic_param = "/right_os1/os1_cloud_node/points"; //input topic
+int ghost_holder, marker_ghost=0; //felesleges markerek eltávolításához
+std_msgs::String msg;
+std::stringstream ss;
+
 
 struct polar {
   int id;
@@ -36,18 +44,29 @@ struct box {
   box *l,*r; //szomszédos filterek - l=left=next, r=right=previous (névütközés miatt)
   bool yx; //y>x (tan -> fi > 45 deg?)
   float fi, o, d; //szög + oldalirányú (tg offset) és hosszirányú (radiális) szorzó paraméterek
+  bool found;
 };
 
 std::vector<box> beams(rep);
 std::vector<box*> beamp(rep+1);
 
-visualization_msgs::Marker marker;
+visualization_msgs::Marker marker,arrtemp;
+visualization_msgs::MarkerArray marray;
 
 std::vector<geometry_msgs::Pose> data(rep);
 std::vector<geometry_msgs::Point> mpoint(rep);
 
+geometry_msgs::Point32 polyp; //polygon pontok (segédváltozó)
+geometry_msgs::PolygonStamped poly; //teljes polygon (pontokból áll)
+
+
+std::vector<int> tempoly; //segédváltozó
+std::vector<std::vector<int>> polyvec; // a ténylegesen padkának vélt pontok indexeit tárolj
+
 ros::Publisher boxfilcloud_pub;
 ros::Publisher marker_pub;
+ros::Publisher marker_array_pub;
+ros::Publisher poly_pub;
 
 bool ptcmpr(polar a, polar b) { return (a.r<b.r); } // r-koordináta alapú összehasonlítás
 struct chain
@@ -64,7 +83,7 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
 {
   int i=0, s=beams[tid].p.size();
   float c;
-  if (beams[tid].yx)
+  if (beams[tid].yx) //ez szűri a pontokat
   {
     while (i<s)
     {
@@ -106,25 +125,25 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
   {
     float max=0;
     int maxind=0;
-    bool found=false;
-    for (int i=0;i<s;i++)
+    beams[tid].found=false;
+    for (int i=0;i<s;i++) //élkeresés
     {
       data[tid].position.x = beams[tid].p[i].r;
       data[tid].position.z = cloud->points[beams[tid].p[i].id].z;
       data[tid].position.y = (i) ? (slope(beams[tid].p[i-1].r,cloud->points[beams[tid].p[i-1].id].z,beams[tid].p[i].r,cloud->points[beams[tid].p[i].id].z)):(0.0); // z/r slope(i-1,i)
       //if (not false positive)
-      if (!found)
+      if (!beams[tid].found)
       {
         if (data[tid].position.y>max)
         {
           max=data[tid].position.y;
           maxind=i;
-          if (data[tid].position.y>slope_param) found=true;
+          if (data[tid].position.y>slope_param) beams[tid].found=true;
         }
       }
     }
   
-    if (found)
+    if (beams[tid].found)
     {
       mpoint[tid].x = cloud->points[beams[tid].p[maxind].id].x;
       mpoint[tid].y = cloud->points[beams[tid].p[maxind].id].y;
@@ -135,7 +154,7 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
   beams[tid].p.clear();
 }
 
-void dyncfg_callback(padkafilter::PadkaConfig &config, uint32_t level)
+void dyncfg_callback(padkafilter::PadkaConfig &config, uint32_t level) //paraméterek állítása
 {
   slope_param = tan(config.slope_angle/180*M_PI);
   frame_param = config.frame;
@@ -150,6 +169,9 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
     pcl::PointCloud<pcl::PointXYZ> cloud;
     pcl::fromPCLPointCloud2(*cloud_in,cloud);
     marker.points.clear();
+    polyvec.clear();
+    tempoly.clear();
+    poly.polygon.points.clear();
     int f, s=cloud.size();
     float r,fi;
 
@@ -165,11 +187,11 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
         if (r<5)
         {
 
-        }//szomszédos nyalábokra is
+        }//szomszédos nyalábokra is - todo?
         */
     }
 /*
-    std::vector<std::thread> beam_threads;
+    std::vector<std::thread> beam_threads; //párhuzamosítás
     for (int i=0; i<rep; i++)
     {
       beam_threads.push_back(std::thread(threadfunc, i, &cloud));
@@ -186,17 +208,82 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
       threadfunc(i,&cloud);
     }
 
-    std_msgs::String msg;
-    std::stringstream ss;
+    {
+      float xp,xn,yp,yn,dirp,dirn;
+      bool first;
+      for (int j=0,i=1, s=marker.points.size()-1; i<s; i++) //talált pontokból a (vélhetően) padkavonalat alkotó pontok kiszűrése
+      {
+        //szomszédos pontok relatív koordinátái
+        xp=marker.points[i].x-marker.points[i-1].x;
+        xn=marker.points[i+1].x-marker.points[i].x;
+        yp=marker.points[i].y-marker.points[i-1].y;
+        yn=marker.points[i+1].y-marker.points[i].y;
 
-    ss << "[debug] marker points: " << marker.points.size();
+        if ((xp*xp+yp*yp)<polydist && (xn*xn+yn*yn)<polydist && abs(atan2(yp,xp)-atan2(yn,xn))<polyangle) //két szomszédos pont közötti táv és szög elég kicsi-e, hogy padka-élet alkossanak - todo: bonyolultabb vizsgálat
+        {
+          if (!first)
+          {
+            tempoly.push_back(i-1); //első pont se maradjon ki
+            first=true;
+          }
+          tempoly.push_back(i);
+        }
+        else if (tempoly.size())
+        {
+          tempoly.push_back(i);  //utolsó pont se maradjon ki
+          polyvec.push_back(tempoly);
+          j++;
+          tempoly.clear();
+          first=false;
+        }
+      }
+    }
+    if (tempoly.size()) polyvec.push_back(tempoly);
+    tempoly.clear();
+    marray.markers.clear();
+    arrtemp.id=0;
+    arrtemp.action = visualization_msgs::Marker::ADD;
+
+    for(int j=0, s0=polyvec.size();j<s0;j++) //polygon megalkotása
+    {
+      arrtemp.points.clear();
+      for (int i=0,s=polyvec[j].size();i<s;i++)
+      {
+        arrtemp.points.push_back(marker.points[polyvec[j][i]]);
+
+        polyp.x=marker.points[polyvec[j][i]].x;
+        polyp.y=marker.points[polyvec[j][i]].y;
+        polyp.z=marker.points[polyvec[j][i]].z;
+        poly.polygon.points.push_back(polyp);
+      }
+
+      if (arrtemp.points.size())
+      {
+        marray.markers.push_back(arrtemp);
+        arrtemp.id++;
+      }
+    }
+
+    //marker ghost removal
+    ghost_holder=polyvec.size();
+    arrtemp.id=ghost_holder;
+    arrtemp.action = visualization_msgs::Marker::DELETE;
+    
+    for (int i=ghost_holder;i<marker_ghost;i++)
+    {
+      marray.markers.push_back(arrtemp);
+      arrtemp.id++;
+    }
+    marker_ghost=ghost_holder;
 
     msg.data = ss.str();
     ROS_INFO("%s", msg.data.c_str());
 
-    // Publish the marker
+    // publish
     marker_pub.publish(marker);
-    
+    marker_array_pub.publish(marray);
+    poly_pub.publish(poly);
+
 }
 
 int main(int argc, char **argv)
@@ -250,8 +337,13 @@ int main(int argc, char **argv)
 
   ros::Subscriber sub = nh.subscribe(topic_param, 1, callback);
   //boxfilcloud_pub = nh.advertise<pcl::PCLPointCloud2>("boxfilter", 1);
+  poly_pub = nh.advertise<geometry_msgs::PolygonStamped>("padka_polygon", 1);
   marker_pub = nh.advertise<visualization_msgs::Marker>("visualization_marker", 1);
+  marker_array_pub = nh.advertise<visualization_msgs::MarkerArray>("padka_marker_array", 1);
   //to_py_pub = nh.advertise<geometry_msgs::PoseArray>("/tmp_py", 1);
+
+  poly.header.frame_id = frame_param;
+  poly.header.stamp = ros::Time::now();
 
   marker.header.frame_id = frame_param;
   marker.header.stamp = ros::Time::now();
@@ -261,7 +353,7 @@ int main(int argc, char **argv)
   marker.id = 0;
 
   marker.lifetime = ros::Duration();
-  // Set the marker type.  Initially this was CUBE, and cycled between that and SPHERE, ARROW, and CYLINDER
+  // Set the marker type.
   marker.type = visualization_msgs::Marker::SPHERE_LIST;
 
   // Set the marker action.  Options are ADD and DELETE
@@ -277,15 +369,40 @@ int main(int argc, char **argv)
   marker.pose.orientation.w = 1.0;
 
   // Set the scale of the marker -- 1x1x1 here means 1m on a side
-  marker.scale.x = .2;
-  marker.scale.y = .2;
-  marker.scale.z = .2;
+  marker.scale.x = .35;
+  marker.scale.y = .35;
+  marker.scale.z = .35;
 
   // Set the color -- be sure to set alpha to something non-zero!
-  marker.color.r = 0.2f;
-  marker.color.g = 0.8f;
+  marker.color.r = 1.0f;
+  marker.color.g = 0.2f;
   marker.color.b = 0.2f;
-  marker.color.a = 0.8f;
+  marker.color.a = 1.0f;
+
+  //marker array (padkavonalak)
+  arrtemp.header.frame_id = frame_param;
+  arrtemp.header.stamp = ros::Time::now();
+  arrtemp.ns = "padka_lines";
+  arrtemp.id = 0;
+
+  arrtemp.lifetime = ros::Duration();
+  arrtemp.type = visualization_msgs::Marker::LINE_STRIP;
+  arrtemp.action = visualization_msgs::Marker::ADD;
+
+  arrtemp.pose.position.x = 0;
+  arrtemp.pose.position.y = 0;
+  arrtemp.pose.position.z = 0;
+  arrtemp.pose.orientation.x = 0.0;
+  arrtemp.pose.orientation.y = 0.0;
+  arrtemp.pose.orientation.z = 0.0;
+  arrtemp.pose.orientation.w = 1.0;
+
+  arrtemp.scale.x = .1;
+
+  arrtemp.color.r = 0.0f;
+  arrtemp.color.g = 1.0f;
+  arrtemp.color.b = 0.5f;
+  arrtemp.color.a = 1.0f;
 
 
   ROS_INFO("STATUS: READY");
