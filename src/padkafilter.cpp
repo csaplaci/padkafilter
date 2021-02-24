@@ -17,15 +17,14 @@
 #include <dynamic_reconfigure/server.h>
 #include <padkafilter/PadkaConfig.h>
 
-int rep=128; // number of detection boxes
-float width=0.2;
-float length=26.0;
-float offset = 2.0; //radiális offset
-float rmin = 2.0;
-float rmax = 26.0;
-float polydist = 4.0; // 2m (négyzete - a számításigény csökkentéséért) //todo ezeket paraméterként
-float polyangle = 1.0; // (rad)
-float Kfi, minfi, maxfi;
+int rep = 512; // number of detection beams
+int beam_param = 0;
+double width = 0.2;
+double rmin = 2.0;
+double rmax = 26.0;
+double polydist = 4.0; // 2m (négyzete - a számításigény csökkentéséért) //todo ezeket paraméterként
+double polyangle = 1.0; // (rad)
+float Kfi;
 double slope_param=1.732; //60 deg
 std::string frame_param = "right_os1/os1_sensor"; //lidar frame
 std::string topic_param = "/right_os1/os1_cloud_node/points"; //input topic
@@ -61,7 +60,7 @@ geometry_msgs::PolygonStamped poly; //teljes polygon (pontokból áll)
 
 
 std::vector<int> tempoly; //segédváltozó
-std::vector<std::vector<int>> polyvec; // a ténylegesen padkának vélt pontok indexeit tárolj
+std::vector<std::vector<int>> polyvec; // a ténylegesen padkának vélt pontok indexeit tárolja
 
 ros::Publisher boxfilcloud_pub;
 ros::Publisher marker_pub;
@@ -77,6 +76,43 @@ struct chain
 float slope(float x0, float y0, float x1, float y1)
 {
   return (y1-y0)/(x1-x0);
+}
+
+void beam_init() //nyaláb inicializálás
+{
+  {
+    float fi, off = 0.5*width; // fi + tangenciális offset (szélesség fele)
+    for (int i=0; i<rep; i++)
+    {
+      fi=i*2*M_PI/rep; // nyaláb (x-tengellyel bezárt) szöge
+      if (abs(tan(fi))>1) // y>x ? (kb. melyik irányba áll inkább)
+      {
+        beams[i].yx=true; //y-irányú
+        beams[i].d = tan(0.5*M_PI-fi); // =1/tan(fi)
+        beams[i].o = off/sin(fi);
+        beams[i].fi=fi; // kell?
+      }
+      else
+      {
+        beams[i].yx=false; //x-irányú
+        beams[i].d = tan(fi);
+        beams[i].o = off/cos(fi);
+        beams[i].fi=fi;
+      }
+      beamp[i]=&beams[i]; //pointerek (lásd lentebb [n+1 -> 0])
+    }
+    beamp[rep+1]=&beams[0]; //az n+1-edik elem a 0-dik elemre hivatkozzon (körkörös hivatkozás kerekítésből adódó hivatkozási hiba megelőzése céljából)
+  }
+  for (int i=0,j=1; j<rep; i++,j++) //pointerek a szomszédos nyalábokra (könnyebb kezelhetőségért - egybeeső területekhez - kell?)
+  {
+    beams[i].l=&beams[j];
+    beams[j].r=&beams[i];
+  }
+  beams[0].r=&beams[rep];
+  beams[rep].l=&beams[0];
+
+  //Kfi = 2*M_PI/rep; //reciprokkal elvileg gyorsabb, mert akkor a továbbiakban szorozni kell, nem osztani
+  Kfi = rep/(2*M_PI);
 }
 
 void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
@@ -157,11 +193,27 @@ void threadfunc (const int tid, const pcl::PointCloud<pcl::PointXYZ> *cloud)
 void dyncfg_callback(padkafilter::PadkaConfig &config, uint32_t level) //paraméterek állítása
 {
   slope_param = tan(config.slope_angle/180*M_PI);
+  beam_param = config.number_of_beams;
+  width = config.width;
+  rmin = config.r_min;
+  rmax = config.r_max;
+  polydist = config.points_max_distance*config.points_max_distance;
+  polyangle = config.points_max_angle/180*M_PI;
   frame_param = config.frame;
   topic_param = config.topic;
+
+  ROS_INFO("[RECONFIGURABLE PARAMETERS]");
+  ROS_INFO("[R] = Node needs to be restarted after reconfiguration.\n");
   ROS_INFO("Slope angle: %f [DEG]", config.slope_angle);
+  ROS_INFO("[R] Number of detection lines/beams: %d", config.number_of_beams);
+  ROS_INFO("Width of the detection lines/beams: %f [m]", config.width);
+  ROS_INFO("Minimum radius of detection: %f [m]", config.r_min);
+  ROS_INFO("Maximum radius of detection: %f [m]", config.r_max);
+  ROS_INFO("Maximum distance allowed between detected (neighbouring) points: %f [m]", config.points_max_distance);
+  ROS_INFO("Maximum angle allowed between detected (neighbouring) points: %f [DEG]", config.points_max_angle);
   ROS_INFO("Frame: \"%s\"", frame_param.c_str());
-  ROS_INFO("Topic: \"%s\" (node needs to be restarted after reconfiguration)", topic_param.c_str());
+  ROS_INFO("[R] Topic: \"%s\"", topic_param.c_str());
+  ROS_INFO("---\n\n");
 };
 
 void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
@@ -181,6 +233,7 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
       if (r>rmax || r<rmin) continue;
       fi=atan2(cloud.points[i].y,cloud.points[i].x);
       if (fi<0) fi+=2*M_PI;
+      // if (fi<minfi || fi>maxfi) continue;
       f=(int)(fi*Kfi);
       beamp[f]->p.push_back(polar{i,r,fi});
         /*
@@ -276,8 +329,12 @@ void callback(const pcl::PCLPointCloud2ConstPtr &cloud_in)
     }
     marker_ghost=ghost_holder;
 
+    /*
+    //debug
+    ss << "rep: " << rep << ", markers: " << marker.points.size();
     msg.data = ss.str();
     ROS_INFO("%s", msg.data.c_str());
+    */
 
     // publish
     marker_pub.publish(marker);
@@ -292,48 +349,24 @@ int main(int argc, char **argv)
   ros::NodeHandle nh;
   ROS_INFO("Padkafilter node started.");
   ROS_INFO("STATUS: INITIALIZING...");
-  ROS_INFO("init_param: %f", slope_param);
-
-
-  { //nyaláb inicializálás
-    float fi, off = 0.5*width; // fi + tangenciális offset (szélesség fele)
-    for (int i=0; i<rep; i++)
-    {
-      fi=i*2*M_PI/rep; // nyaláb (x-tengellyel bezárt) szöge
-      if (abs(tan(fi))>1) // y>x ? (kb. melyik irányba áll inkább)
-      {
-        beams[i].yx=true; //y-irányú
-        beams[i].d = tan(0.5*M_PI-fi); // =1/tan(fi)
-        beams[i].o = off/sin(fi);
-        beams[i].fi=fi; // kell?
-      }
-      else
-      {
-        beams[i].yx=false; //x-irányú
-        beams[i].d = tan(fi);
-        beams[i].o = off/cos(fi);
-        beams[i].fi=fi;
-      }
-      beamp[i]=&beams[i]; //pointerek (lásd lentebb [n+1 -> 0])
-    }
-    beamp[rep+1]=&beams[0]; //az n+1-edik elem a 0-dik elemre hivatkozzon (körkörös hivatkozás kerekítésből adódó hivatkozási hiba megelőzése céljából)
-  }
-  for (int i=0,j=1; j<rep; i++,j++) //pointerek a szomszédos nyalábokra (könnyebb kezelhetőségért - egybeeső területekhez - kell?)
-  {
-    beams[i].l=&beams[j];
-    beams[j].r=&beams[i];
-  }
-  beams[0].r=&beams[rep];
-  beams[rep].l=&beams[0];
-
-  //Kfi = 2*M_PI/rep; //reciprokkal elvileg gyorsabb, mert akkor a továbbiakban szorozni kell, nem osztani
-  Kfi = rep/(2*M_PI);
 
   dynamic_reconfigure::Server<padkafilter::PadkaConfig> dyncfg_server;
   dynamic_reconfigure::Server<padkafilter::PadkaConfig>::CallbackType cbt;
 
   cbt = boost::bind(dyncfg_callback, _1, _2);
   dyncfg_server.setCallback(cbt);
+
+  if (beam_param) rep=beam_param; else rep = 128;
+
+  beams.clear();
+  beamp.clear();
+  data.clear();
+  mpoint.clear();
+  beams.resize(rep);
+  beamp.resize(rep+1);
+  data.resize(rep);
+  mpoint.resize(rep);
+  beam_init();
 
   ros::Subscriber sub = nh.subscribe(topic_param, 1, callback);
   //boxfilcloud_pub = nh.advertise<pcl::PCLPointCloud2>("boxfilter", 1);
